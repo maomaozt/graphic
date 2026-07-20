@@ -1,0 +1,398 @@
+# NVIDIA Nsight Graphics vs Seagull (FrameProfiler) 功能与实现原理对比
+
+> 涉及代码库：
+>
+> - Seagull/FrameProfiler：`D:\fp\code\Seagull\`（基于 RenderDoc 的华为 GPU 工具）
+> - GPU Counter：`D:\fp\code\gpu_counters\`（KMD-based counter 采集 + MaleoonShaderProfiler）
+>
+> 注：本文基于公开资料对 NVIDIA Nsight Graphics 的了解，与对 Seagull 代码库的实际探索进行对比。
+
+---
+
+## 一、产品定位
+
+| 维度         | NVIDIA Nsight Graphics                     | Seagull (FrameProfiler)                      |
+| ------------ | ------------------------------------------ | -------------------------------------------- |
+| **厂商**     | NVIDIA                                     | 华为（海思）                                 |
+| **目标 GPU** | NVIDIA GPU（GeForce/Quadro/Tesla/Orin 等） | 华为 Maleoon GPU（V100/V200/V300）           |
+| **目标平台** | Windows / Linux（x86）                     | Android / OHOS / Linux-Arm / PC-Arm / CModel |
+| **产品名称** | Nsight Graphics（NG）                      | Seagull / FrameProfiler（内部代号 squid）    |
+| **基础框架** | NVIDIA 自研                                | 基于 RenderDoc 开源框架扩展                  |
+| **定位**     | 专业图形调试 + 性能分析                    | 移动端图形调试 + 性能分析                    |
+
+---
+
+## 二、支持的图形 API
+
+| API                    | Nsight Graphics                     | Seagull                                          |
+| ---------------------- | ----------------------------------- | ------------------------------------------------ |
+| **Vulkan**             | ✅ 完整支持（1.3+）                  | ✅ 完整支持（Vulkan Layer + 华为扩展）            |
+| **OpenGL / OpenGL ES** | ✅ 支持                              | ✅ 支持（GLES 拦截库 `libVkLayer_GLES_Squid.so`） |
+| **Direct3D 11**        | ✅ 支持                              | ❌ 不支持                                         |
+| **Direct3D 12**        | ✅ 支持                              | ❌ 不支持                                         |
+| **Maleoon 原生 API**   | ❌                                   | ✅ 独立 Maleoon 驱动（`mln_*` / `rpl_*`）         |
+| **OpenCL**             | ❌（由 Nsight Compute 负责）         | ✅ 支持（OpenCL Trace，单 kernel 捕获）           |
+| **CUDA**               | ❌（由 Nsight Compute/Eclipse 负责） | ❌                                                |
+| **RTX / Ray Tracing**  | ✅ 支持（DXR / VK Ray）              | ✅ 有限支持（Maleoon RT 扩展）                    |
+
+---
+
+## 三、核心功能对比
+
+### 3.1 帧捕获
+
+| 功能             | Nsight Graphics           | Seagull                                                      |
+| ---------------- | ------------------------- | ------------------------------------------------------------ |
+| **单帧捕获**     | ✅                         | ✅ `Capture Frame(s) Immediately`                             |
+| **连续帧捕获**   | ✅                         | ✅ `Sequential Frame(s) Start`                                |
+| **延时捕获**     | ✅                         | ✅ `Deferring Capture`（环形缓冲 + 最大文件大小）             |
+| **智能条件捕获** | ❌（手动触发为主）         | ✅ **特色功能**：基于 drawcall 数/顶点数/FPS/帧时间/GPU 频率/shader 变化等条件触发 |
+| **捕获文件格式** | `.ndc` / `.nzp`           | `.rdc`（RenderDoc 格式）/ `.sqd`（连续帧）                   |
+| **命令行捕获**   | ✅ `nvperf` / `nvidia-smi` | ✅ `SquidCmdBin capture` / `squidcmd`                         |
+| **跨 GPU 回放**  | ✅（同代 GPU）             | ✅ **特色功能**：Cross-GPU（Vulkan Profile XML 覆盖扩展/特性集） |
+
+**智能捕获条件**（Seagull 独有，`FrameProfiler-usage-android.adoc:117-157`）：
+
+- Frame Number / RT Clear 数 / Error Gets 数
+- Use Program Calls / BindBuffer Calls / BindTexture Calls
+- RT Changes / Draw Calls / Vertex Count / Indexed Vertex Count
+- FPS 阈值 / Frame Time 阈值 / GPU Frequency 阈值
+- USE DifferentShader（新 shader 首次使用时触发）
+
+### 3.2 帧回放与调试
+
+| 功能                  | Nsight Graphics        | Seagull                                                      |
+| --------------------- | ---------------------- | ------------------------------------------------------------ |
+| **回放引擎**          | 自研                   | RenderDoc replay（VulkanReplay / MaleoonReplayDriver）       |
+| **CModel 回放**       | ❌                      | ✅ **特色功能**：在 CModel 驱动上回放（`squidcmd replay --cmodel`） |
+| **事件浏览器**        | ✅ Event Browser        | ✅ Event Browser（EID 序列 + API 调用树）                     |
+| **纹理查看器**        | ✅ Texture Viewer       | ✅ Texture Viewer（查看/锁定/导出 dds/exr/png/jpg/bmp）       |
+| **缓冲查看器**        | ✅ Buffer Viewer        | ✅ Buffer Viewer                                              |
+| **Shader 查看器**     | ✅ Source + Disassembly | ✅ Shader Viewer（源码 + SPIR-V 反汇编）                      |
+| **管线状态**          | ✅ Pipeline State       | ✅ Pipeline State（纹理绑定/采样器等）                        |
+| **顶点调试 (PostVS)** | ✅                      | ✅ Vertex Debugging（顶点后数据查看）                         |
+| **像素调试**          | ✅ Pixel History        | ✅ Pixel Debugging（Pixel Context + Pixel History）           |
+| **API 事件书签**      | ✅                      | ✅ Ctrl+B 书签 + Ctrl+0-9 快速跳转                            |
+| **关键帧裁剪**        | ✅                      | ✅ Keyframe Trimming（选 draw call 裁剪出独立 .rdc）          |
+| **资源检查器**        | ✅ Resource Inspector   | ✅ Resource Inspector（父子资源 + 帧内使用）                  |
+| **资源依赖图**        | ✅（有限）              | ✅ **Dependent Viewer**：RenderPass 间资源依赖图（`--enable-resourcemap-show`） |
+
+### 3.3 性能分析
+
+| 功能                 | Nsight Graphics                             | Seagull                                                  |
+| -------------------- | ------------------------------------------- | -------------------------------------------------------- |
+| **GPU Counter 采集** | ✅ **per-draw 级别**（插入 timestamp query） | ✅ **per-job 级别**（KMD 旁路采样，PREJOB/POSTJOB）       |
+| **Counter 粒度**     | per-draw / per-dispatch（精细）             | per-job（粗粒度，约等于 per-drawcall）                   |
+| **Counter 来源**     | NVIDIA 驱动（UMD 注入 query）               | Maleoon KMD（硬件寄存器 dump + DFX Timeline）            |
+| **Range Profiler**   | ✅ **特色功能**：时间段范围内聚合分析        | ❌                                                        |
+| **GPU Trace**        | ✅ 时间线视图（draw/dispatch/block）         | ✅ TraceViewer（RenderPass/Viewport/Program 块时间线）    |
+| **性能计数器可视化** | ✅ 图表 + 表格                               | ✅ Performance Counter Viewer（图表 + EID 缩略图联动）    |
+| **Shader Profiler**  | ✅ 行级执行时间                              | ✅ MaleoonShaderProfiler（指令级分析 + 寄存器活跃分析）   |
+| **Shader 指令分析**  | ✅ SASS 反汇编 + 指令统计                    | ✅ **特色**：ALU 16/32 位精度统计、寄存器活跃度、分支分析 |
+| **内存分析**         | ✅ Memory Statistics                         | ❌（基础资源大小统计）                                    |
+| **带宽分析**         | ✅ Bandwidth                                 | ✅ 通过 counter 间接获取                                  |
+| **占用率分析**       | ✅ Occupancy                                 | ❌                                                        |
+
+### 3.4 Shader 分析
+
+| 功能             | Nsight Graphics             | Seagull (MaleoonShaderProfiler)                              |
+| ---------------- | --------------------------- | ------------------------------------------------------------ |
+| **源码查看**     | ✅ HLSL/GLSL → SPIR-V → SASS | ✅ GLSL → SPIR-V → Maleoon ISA                                |
+| **反汇编**       | ✅ SASS（NVIDIA 汇编）       | ✅ Maleoon ISA（CAF/CFF/Sample/LSD/LSG/Ray 指令解码）         |
+| **指令统计**     | ✅                           | ✅ ALU 指令数 / 16-bit vs 32-bit 精度比例                     |
+| **寄存器分析**   | ✅                           | ✅ **特色**：寄存器活跃度分析（active/assigned/reads/reassigned） |
+| **行级执行时间** | ✅（插桩 getclk）            | ✅（插桩 getclkl/getclkh，见 `Shader行执行时间分析.md`）      |
+| **Shader 插桩**  | ✅                           | ✅ ShaderInstrumentor（二进制插桩）                           |
+| **精度分析**     | ❌                           | ✅ **特色**：fp16/fp32 指令级精度统计                         |
+| **分支分析**     | ✅                           | ✅ 控制流指令识别                                             |
+
+---
+
+## 四、实现原理对比
+
+### 4.1 API 拦截机制
+
+| 方面             | Nsight Graphics                      | Seagull                                                      |
+| ---------------- | ------------------------------------ | ------------------------------------------------------------ |
+| **Vulkan 拦截**  | NVIDIA 驱动内置 hook（用户态驱动层） | Vulkan Layer（`vkGetInstanceProcAddr` + dispatch table，基于 RenderDoc） |
+| **GLES 拦截**    | NVIDIA 驱动内置                      | 独立拦截库 `libVkLayer_GLES_Squid.so`（LD_PRELOAD 注入）     |
+| **Maleoon 拦截** | N/A                                  | `MlnLayerAttach` + `MlnGetDeviceProcAddr`（自定义 Layer 规范） |
+| **OpenCL 拦截**  | N/A                                  | libOpenCL 替换（`mv libmali.so real_libmali.so`）            |
+| **拦截层级**     | 驱动内部（UMD 层）                   | 应用与驱动之间（Layer 层）                                   |
+| **对应用透明度** | 完全透明                             | 透明（需推送拦截库）                                         |
+
+### 4.2 帧捕获原理
+
+| 方面               | Nsight Graphics  | Seagull                                                      |
+| ------------------ | ---------------- | ------------------------------------------------------------ |
+| **序列化方式**     | 自研序列化       | RenderDoc chunk 序列化（`VulkanChunk::*` + `SystemChunk::*`） |
+| **初始状态抓取**   | 驱动内部资源快照 | 插入 `vkCmdCopyImageToBuffer`/`vkCmdCopyBuffer` 复制到回读缓冲 |
+| **华为扩展序列化** | N/A              | `VulkanChunkEx::*`（扩展 chunk，EndFrameCapture 时合并）     |
+| **Maleoon 序列化** | N/A              | 两阶段：Frame Data（元数据）+ Real Replay（真实重放）        |
+| **文件格式**       | `.ndc`（二进制） | `.rdc`（RenderDoc 格式，LZ4 压缩）                           |
+
+### 4.3 Counter 采集原理（核心差异）
+
+| 方面           | Nsight Graphics                                              | Seagull (gpu_counters)                                     |
+| -------------- | ------------------------------------------------------------ | ---------------------------------------------------------- |
+| **采集方式**   | **插入 query 对象**到命令流（GPU timestamp query + occlusion query） | **旁路读取硬件寄存器**（KMD ioctl dump，不修改命令流）     |
+| **对渲染影响** | 有影响（插入 query 命令）                                    | 无影响（只读监控寄存器）                                   |
+| **粒度控制**   | 精确到 per-draw / per-dispatch（query 对象绑定到具体 draw）  | per-job（PREJOB/POSTJOB 事件触发，约等于 per-drawcall）    |
+| **时间戳机制** | GPU timestamp query（硬件级精确）                            | KMD 采样时间戳 + DFX Timeline 事件                         |
+| **边界识别**   | 应用 API 调用序列（每条命令已知）                            | KMD 上报 DFX 事件（`TIMELINE_CHAIN_BOUNDARY` + chainType） |
+| **数据来源**   | NVIDIA UMD（用户态驱动）                                     | Maleoon KMD（内核驱动，`/dev/hvgr0`）                      |
+| **架构**       | UMD 内嵌                                                     | 独立进程（`CollectorGpuCountersDfxEvents`）                |
+
+**Nsight Graphics Counter 流程**：
+
+```
+应用 draw call
+   │
+   ▼
+Nsight 注入 vkCmdBeginQuery / vkCmdWriteTimestamp（前）
+   │
+   ▼
+GPU 执行 draw
+   │
+   ▼
+Nsight 注入 vkCmdEndQuery / vkCmdWriteTimestamp（后）
+   │
+   ▼
+vkGetQueryPoolResults → per-draw counter + 精确时间
+```
+
+**Seagull Counter 流程**：
+
+```
+应用 draw call
+   │
+   ▼ （不插入任何命令）
+GPU 执行 → KMD 上报 DFX Timeline 事件（chainBoundary begin/end）
+   │
+   ├── Counter 流：KMD 周期性 dump 硬件寄存器到 ring buffer
+   │     └── eventId 标记（PERIODIC / PREJOB / POSTJOB）
+   │
+   └── DFX 事件流：KMD JobSlot Record → 时间线事件
+         └── chainType(0,1=Render / 2,3=Binning / 4,5=Compute)
+   │
+   ▼
+后处理：按时间戳将 counter 采样点关联到 pass/dispatch 区间
+```
+
+### 4.4 Shader 分析原理
+
+| 方面           | Nsight Graphics             | Seagull (MaleoonShaderProfiler)                              |
+| -------------- | --------------------------- | ------------------------------------------------------------ |
+| **反汇编引擎** | NVIDIA SASS Decoder（闭源） | Maleoon ISA Decoder（开源，`MaleoonV100/V200/V300InstructionDecoder`） |
+| **指令类型**   | SASS 指令（NVIDIA 专有）    | CAF/CFF/Sample/LSD/LSG/Ray/ECAF/ECFF（Maleoon 专有）         |
+| **精度分析**   | 不提供                      | ✅ `GetAluCountFullPrecision` 逐指令精度位解析                |
+| **寄存器分析** | 不提供                      | ✅ `RegisterAnalyzer` 活跃/分配/读取/重分配分析               |
+| **插桩方式**   | NVIDIA 编译器内置           | `ShaderInstrumentor` 二进制插桩（getclkl/getclkh）           |
+| **行级时间**   | ✅ 编译器注解映射            | ✅ 插桩 getclkl/getclkh 读取 GPU cycle 计数器                 |
+
+### 4.5 回放原理
+
+| 方面             | Nsight Graphics | Seagull                                                     |
+| ---------------- | --------------- | ----------------------------------------------------------- |
+| **回放驱动**     | NVIDIA 真实驱动 | Maleoon 真实驱动 / CModel 仿真驱动                          |
+| **回放模式**     | 直接重放        | 单阶段（Vulkan）/ 两阶段（Maleoon：FrameData + RealReplay） |
+| **部分回放**     | ✅ 范围选择      | ✅ PartialReplayLayer + FilterLayer 动态插入                 |
+| **资源状态恢复** | 驱动内部快照    | RestoreLayer.OnRenderingBegin/End 显式快照                  |
+| **跨平台回放**   | 同代 GPU        | ✅ Cross-GPU（Vulkan Profile XML 覆盖）+ CModel 回放         |
+
+---
+
+## 五、架构对比
+
+### 5.1 整体架构
+
+**Nsight Graphics**：
+
+```
+┌─────────────────────────────────┐
+│      Nsight Graphics UI          │
+│  (Qt-based, Windows/Linux)       │
+└──────────────┬──────────────────┘
+               │
+┌──────────────▼──────────────────┐
+│   NVIDIA Driver (UMD)            │
+│  ┌─────────────────────────┐    │
+│  │ API Hook (D3D/VK/GL)     │    │
+│  │ Query Injection           │    │
+│  │ Resource Snapshot         │    │
+│  └─────────────────────────┘    │
+│  ┌─────────────────────────┐    │
+│  │ SASS Decoder             │    │
+│  │ Range Profiler           │    │
+│  └─────────────────────────┘    │
+└─────────────────────────────────┘
+```
+
+**Seagull**：
+
+```
+┌─────────────────────────────────┐
+│   FrameProfiler UI (Seagull)     │
+│  (RenderDoc-based, Qt)           │
+└──────────────┬──────────────────┘
+               │
+┌──────────────▼──────────────────┐
+│   RenderDoc Core (开源扩展)       │
+│  ┌─────────────────────────┐    │
+│  │ Vulkan Layer             │    │
+│  │ GLES Interceptor         │    │
+│  │ OpenCL Trace              │    │
+│  │ Maleoon Driver            │    │
+│  └─────────────────────────┘    │
+│  ┌─────────────────────────┐    │
+│  │ Chunk Serialiser         │    │
+│  │ Resource Manager         │    │
+│  │ Replay Engine            │    │
+│  └─────────────────────────┘    │
+└─────────────────────────────────┘
+               │
+┌──────────────▼──────────────────┐
+│   gpu_counters (独立工具)         │
+│  ┌─────────────────────────┐    │
+│  │ KMD ioctl (硬件寄存器)    │    │
+│  │ DFX Timeline              │    │
+│  │ MaleoonShaderProfiler     │    │
+│  └─────────────────────────┘    │
+└─────────────────────────────────┘
+```
+
+### 5.2 代码开放性
+
+| 方面                | Nsight Graphics | Seagull                         |
+| ------------------- | --------------- | ------------------------------- |
+| **核心代码**        | 闭源            | 基于 RenderDoc 开源（GPL）      |
+| **扩展代码**        | 闭源            | 华为扩展开源（内部仓库）        |
+| **Counter 工具**    | 闭源            | `gpu_counters` 独立仓库（内部） |
+| **Shader Profiler** | 闭源            | `MaleoonShaderProfiler`（内部） |
+| **可定制性**        | 低              | 高（可修改 RenderDoc 源码）     |
+
+---
+
+## 六、特色功能对比
+
+### 6.1 Seagull 独有功能
+
+| 功能                      | 说明                                                  | 文档位置                                           |
+| ------------------------- | ----------------------------------------------------- | -------------------------------------------------- |
+| **智能条件捕获**          | 基于 drawcall 数/顶点数/FPS/shader 变化等自动触发捕获 | `FrameProfiler-usage-android.adoc:117`             |
+| **CModel 回放**           | 在 CModel 仿真驱动上回放 .rdc 帧（无硬件开发）        | `FrameProfiler-usage-cmodel.adoc`                  |
+| **OpenCL Trace**          | OpenCL kernel 捕获与回放（NormalMode/EnforcingMode）  | `FrameProfiler-opencl-trace.adoc`                  |
+| **Maleoon 原生 API 驱动** | 对 Maleoon 自研 API 的抓帧/回放支持                   | `frameproj/renderdoc/driver/maleoon/`              |
+| **Dependent Viewer**      | RenderPass 间资源依赖图可视化                         | `FrameProfiler-usage-android.adoc:508`             |
+| **Cross-GPU 回放**        | 不同 GPU 间回放（Vulkan Profile XML 覆盖扩展集）      | `FrameProfiler-usage-android.adoc:167`             |
+| **ALU 精度分析**          | Shader 二进制逐指令 fp16/fp32 精度统计                | `MaleoonShaderProfiler/src/ShaderAnalyzer.cpp:201` |
+| **寄存器活跃分析**        | VGPR/SGPR 活跃度/分配/读取/重分配分析                 | `MaleoonShaderProfiler/src/RegisterAnalyzer.cpp`   |
+| **KMD 旁路 Counter**      | 不插入 query，纯硬件寄存器 dump（零渲染干扰）         | `gpu_counters/src/gpu_counters/Teller.h`           |
+
+### 6.2 Nsight Graphics 独有功能
+
+| 功能                    | 说明                                                   |
+| ----------------------- | ------------------------------------------------------ |
+| **per-draw Counter**    | 精确到每个 draw call 的 GPU counter（通过 query 对象） |
+| **Range Profiler**      | 时间段范围内聚合性能分析                               |
+| **Direct3D 11/12 支持** | 完整 D3D 调试                                          |
+| **RTX/DXR 支持**        | 完整光线追踪调试                                       |
+| **Memory Statistics**   | 详细的 GPU 内存使用分析                                |
+| **Occupancy 分析**      | GPU 占用率分析                                         |
+| **Shader 性能建议**     | 编译器级优化建议                                       |
+| **Video Profiling**     | 视频编解码分析                                         |
+| **DRED**                | Device Removed Extended Data（TDR 崩溃分析）           |
+| **AccuRender**          | GPU 精确渲染验证                                       |
+| **NVIDIA DLSS 分析**    | AI 超分辨率分析                                        |
+
+---
+
+## 七、技术成熟度对比
+
+| 维度                | Nsight Graphics          | Seagull                         |
+| ------------------- | ------------------------ | ------------------------------- |
+| **产品成熟度**      | 高（商业产品，多年迭代） | 中（内部工具，持续开发中）      |
+| **API 覆盖**        | 广（D3D/VK/GL/RT）       | 聚焦移动（VK/GLES/CL/Maleoon）  |
+| **Counter 精度**    | 高（per-draw）           | 中（per-job）                   |
+| **Counter 保真度**  | 中（插入 query 有干扰）  | 高（旁路读取无干扰）            |
+| **跨平台能力**      | 同代 GPU                 | Cross-GPU + CModel              |
+| **Shader 分析深度** | 高（SASS + 行级时间）    | 中高（ISA + 精度 + 寄存器分析） |
+| **文档完整性**      | 高（官方文档完善）       | 中（内部 adoc 文档）            |
+| **UI 易用性**       | 高                       | 中（基于 RenderDoc UI）         |
+
+---
+
+## 八、关键文件索引
+
+### Seagull 关键文件
+
+| 文件            | 路径                                                         | 作用                       |
+| --------------- | ------------------------------------------------------------ | -------------------------- |
+| 主 README       | `D:\fp\code\Seagull\README.md`                               | FrameProfiler 说明         |
+| 用户文档        | `D:\fp\code\Seagull\docs\FrameProfiler.adoc`                 | 主用户指南                 |
+| Android 用法    | `D:\fp\code\Seagull\docs\FrameProfiler-usage-android.adoc`   | Android 平台用法           |
+| 命令行          | `D:\fp\code\Seagull\docs\FrameProfiler-command-line.adoc`    | SquidCmdBin 命令行         |
+| CModel 回放     | `D:\fp\code\Seagull\docs\FrameProfiler-usage-cmodel.adoc`    | CModel 回放指南            |
+| OpenCL Trace    | `D:\fp\code\Seagull\docs\FrameProfiler-opencl-trace.adoc`    | OpenCL 追踪指南            |
+| Vulkan 驱动     | `D:\fp\code\Seagull\frameproj\renderdoc\driver\vulkan\`      | Vulkan 抓帧/回放           |
+| Maleoon 驱动    | `D:\fp\code\Seagull\frameproj\renderdoc\driver\maleoon\`     | Maleoon 抓帧/回放          |
+| GPU Counter     | `D:\fp\code\gpu_counters\src\`                               | KMD counter 采集           |
+| Shader Profiler | `D:\fp\code\gpu_counters\MaleoonShaderProfiler\src\`         | Shader 二进制分析          |
+| 指令解码器      | `D:\fp\code\gpu_counters\MaleoonShaderProfiler\src\MaleoonV300InstructionDecoder.cpp` | V300 ISA 解码              |
+| Shader 分析器   | `D:\fp\code\gpu_counters\MaleoonShaderProfiler\src\ShaderAnalyzer.cpp` | ALU 精度统计               |
+| 寄存器分析器    | `D:\fp\code\gpu_counters\MaleoonShaderProfiler\src\RegisterAnalyzer.cpp` | 寄存器活跃分析             |
+| Counter Teller  | `D:\fp\code\gpu_counters\src\gpu_counters\Teller.h`          | KMD ioctl 封装             |
+| DFX 事件分发    | `D:\fp\code\gpu_counters\src\collector\IProcessorDfxEvents.h` | DFX 事件按类型分发         |
+| Timeline 定义   | `D:\fp\code\gpu_counters\include\IDriver.h`                  | TimelineEventType + 结构体 |
+
+### 技术文档
+
+| 文档             | 路径                                                         | 内容                       |
+| ---------------- | ------------------------------------------------------------ | -------------------------- |
+| GPU 性能分析     | `D:\fp\code\gpu_counters\GPU性能分析技术文档.md`             | Counter 采集机制总览       |
+| 观测者效应       | `D:\fp\code\gpu_counters\GPU_Trace工具链观测者效应分析.md`   | 插桩 vs counter 对渲染影响 |
+| 时间戳同步       | `D:\fp\code\gpu_counters\GPU_Trace时间戳同步分析.md`         | CPU-GPU 时间对齐           |
+| 时间戳标定       | `D:\fp\code\gpu_counters\GPU_Trace时间戳标定分析.md`         | 时间戳精度标定             |
+| Counter 影响分析 | `D:\fp\code\gpu_counters\Replay中注入Counter对渲染结果影响分析.md` | Counter 注入对渲染影响     |
+| Shader 行时间    | `D:\fp\code\gpu_counters\Shader行执行时间分析.md`            | Shader 插桩行级时间分析    |
+| HiGPA Trace      | `D:\fp\code\gpu_counters\HiGPA_Trace代码分析.md`             | HiGPA 上层工具分析         |
+
+---
+
+## 九、总结
+
+### 核心差异
+
+1. **Counter 采集机制**是最大差异：
+   - Nsight：**插入式**（query 对象绑定到 draw，精确但有渲染干扰）
+   - Seagull：**旁路式**（KMD 读取硬件寄存器，零干扰但粒度粗）
+
+2. **平台定位**决定功能侧重：
+   - Nsight：桌面级 D3D/VK 全能工具，per-draw 精度
+   - Seagull：移动端 VK/GLES/CL 工具，跨平台 + CModel 仿真
+
+3. **架构基础**不同：
+   - Nsight：NVIDIA 驱动内嵌，深度集成
+   - Seagull：RenderDoc 开源框架扩展 + 独立 gpu_counters
+
+### 各自优势
+
+**Nsight Graphics 优势**：
+
+- per-draw 精度 Counter（行业最高标准）
+- 完整 D3D 11/12 支持
+- Range Profiler 时间段聚合分析
+- 商业级 UI 和文档
+- RTX/DXR 完整支持
+
+**Seagull 优势**：
+
+- 零渲染干扰的 Counter 采集（KMD 旁路）
+- 智能条件捕获（自动触发）
+- CModel 仿真回放（无硬件开发）
+- Cross-GPU 跨平台回放
+- OpenCL Trace 支持
+- Maleoon 原生 API 支持
+- ALU 精度分析 + 寄存器活跃分析（Nsight 不提供）
+- RenderPass 资源依赖图可视化
+- 开源可定制（基于 RenderDoc）
